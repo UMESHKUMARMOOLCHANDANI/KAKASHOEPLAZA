@@ -605,6 +605,8 @@ header::after{content:'';display:block;height:3px;background:linear-gradient(90d
   #printArea{display:block;position:absolute;top:0;left:0;width:100%;padding:20px;color:#000;background:#fff;}
 }
 </style>
+<script src="https://www.gstatic.com/firebasejs/10.7.1/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.7.1/firebase-firestore-compat.js"></script>
 </head>
 <body>
 
@@ -1285,13 +1287,51 @@ const LS = {
   wish: "ksp_wishlist", overrides: "ksp_admin_overrides", customProducts: "ksp_custom_products", deleted: "ksp_deleted_products", customCategories: "ksp_custom_categories", faqs: "ksp_faqs", storeProfile: "ksp_store_profile", palette: "ksp_palette", siteImages: "ksp_site_images",
   adminPassword: "ksp_admin_password", brands: "ksp_brands", heroContent: "ksp_hero_content", storeHours: "ksp_store_hours", enquiryLog: "ksp_enquiry_log"
 };
+
+/* ---------- Firebase / Firestore: shared store data, synced across all visitors ----------
+   Only store-wide configuration syncs here (products, prices, FAQs, brand list, store
+   profile, colours, site images, hero text, store hours). Each visitor's own wishlist,
+   the device-local enquiry log, and the admin password NEVER leave this browser. */
+const FIRESTORE_SYNCED_KEYS = {
+  overrides: "overrides", customProducts: "customProducts", deleted: "deleted",
+  customCategories: "customCategories", faqs: "faqs", storeProfile: "storeProfile",
+  palette: "palette", siteImages: "siteImages", brands: "brands",
+  heroContent: "heroContent", storeHours: "storeHours"
+};
+let firestoreDb = null;
+try {
+  const firebaseConfig = {
+    apiKey: "AIzaSyBxWYNU7HURaucUh6SRACRdkZFRd1rbIZ8",
+    authDomain: "kaka-shoe-plaza-39aba.firebaseapp.com",
+    projectId: "kaka-shoe-plaza-39aba",
+    storageBucket: "kaka-shoe-plaza-39aba.firebasestorage.app",
+    messagingSenderId: "519777436580",
+    appId: "1:519777436580:web:770ed1577b3b1ea2bc7731",
+    measurementId: "G-QG62D4S40C"
+  };
+  if(typeof firebase !== 'undefined'){
+    firebase.initializeApp(firebaseConfig);
+    firestoreDb = firebase.firestore();
+  }
+} catch(e){ console.log('Firebase not available; store changes will stay on this device only.'); }
+const FIRESTORE_DOC_PATH = ['stores','kaka-shoe-plaza'];
+
 function loadJSON(key, fallback){
   try { const v = JSON.parse(localStorage.getItem(key)); return v || fallback; }
   catch(e){ return fallback; }
 }
-function saveJSON(key, val){
+function saveLocalOnly(key, val){
   try { localStorage.setItem(key, JSON.stringify(val)); }
   catch(e){ /* storage blocked (private mode, sandboxed preview, etc) — keep working in-memory */ }
+}
+function saveJSON(key, val){
+  saveLocalOnly(key, val);
+  const fsField = Object.keys(LS).find(k => LS[k] === key && FIRESTORE_SYNCED_KEYS[k]);
+  if(fsField && firestoreDb){
+    firestoreDb.collection(FIRESTORE_DOC_PATH[0]).doc(FIRESTORE_DOC_PATH[1])
+      .set({ [FIRESTORE_SYNCED_KEYS[fsField]]: val }, { merge: true })
+      .catch(err => console.log('Firestore sync failed for', fsField, '(saved locally on this device instead):', err.message));
+  }
 }
 loadJSON(LS.customCategories, []).forEach(c=>{ if(!CATEGORIES.includes(c)) CATEGORIES.push(c); });
 
@@ -3045,44 +3085,91 @@ renderNewArrivals();
 renderCompareBar();
 updateBadges();
 
-/* Fetch external product data JSON and use it for the frontend, if available.
-   Requires the page to be served over HTTP (a real web host) — fetch() of a
-   local JSON file is blocked by browsers when the page is opened via file://.
-   If the fetch fails for any reason, the site keeps using the data already
-   embedded above, so it never breaks. */
-try {
-  fetch('kaka-shoe-plaza-data.json')
-    .then(res => { if(!res.ok) throw new Error('HTTP '+res.status); return res.json(); })
-    .then(data => {
-      if(!data || !Array.isArray(data.products) || data.products.length===0) throw new Error('bad data shape');
-      PRISTINE_PRODUCTS.splice(0, PRISTINE_PRODUCTS.length, ...JSON.parse(JSON.stringify(data.products)));
-      if(Array.isArray(data.categories) && data.categories.length){
-        CATEGORIES.splice(0, CATEGORIES.length, ...data.categories);
-      }
-      if(Array.isArray(data.faqs) && data.faqs.length && !loadJSON(LS.faqs, null)){
-        FAQS = data.faqs;
-      }
-      rebuildProductsFromStorage();
-      renderChips();
-      renderProductGrid();
-      renderBestSellers();
-      renderNewArrivals();
-      renderCompareBar();
-      renderFAQList();
-      const heroCountEl2 = document.getElementById('heroProductCount');
-      if(heroCountEl2) heroCountEl2.textContent = PRODUCTS.filter(hasImage).length + '+';
-      const openMatch = /^#product-(\d+)$/.exec(location.hash);
-      if(openMatch && productModalScrim.classList.contains('open')){
-        openProductModal(Number(openMatch[1]));
-      }
-      console.log('Loaded product data from kaka-shoe-plaza-data.json');
-    })
-    .catch(err => {
-      console.log('kaka-shoe-plaza-data.json not used (using embedded data instead):', err.message);
-    });
-} catch(e) {
-  console.log('fetch not available in this environment; using embedded data instead.');
+/* Load the shared store data — Firestore first (instant, updates the moment admin
+   saves anything), then the static JSON file (works even if Firebase is unreachable),
+   then finally the data already embedded above (works even fully offline / file://). */
+function applyFetchedStoreData(data, sourceLabel){
+  if(!data || !Array.isArray(data.products) || data.products.length===0) return false;
+  PRISTINE_PRODUCTS.splice(0, PRISTINE_PRODUCTS.length, ...JSON.parse(JSON.stringify(data.products)));
+  if(Array.isArray(data.categories) && data.categories.length){
+    CATEGORIES.splice(0, CATEGORIES.length, ...data.categories);
+  }
+  if(Array.isArray(data.faqs) && data.faqs.length && !loadJSON(LS.faqs, null)){
+    FAQS = data.faqs;
+  }
+  rebuildProductsFromStorage();
+  renderChips();
+  renderProductGrid();
+  renderBestSellers();
+  renderNewArrivals();
+  renderCompareBar();
+  renderFAQList();
+  const heroCountEl2 = document.getElementById('heroProductCount');
+  if(heroCountEl2) heroCountEl2.textContent = PRODUCTS.filter(hasImage).length + '+';
+  const openMatch = /^#product-(\d+)$/.exec(location.hash);
+  if(openMatch && productModalScrim.classList.contains('open')){
+    openProductModal(Number(openMatch[1]));
+  }
+  console.log('Loaded product data from '+sourceLabel);
+  return true;
 }
+
+function applyFirestoreAdminFields(doc){
+  ['overrides','customProducts','deleted','customCategories'].forEach(k=>{
+    if(doc[k] !== undefined) saveLocalOnly(LS[k], doc[k]);
+  });
+  if(Array.isArray(doc.customCategories)){
+    doc.customCategories.forEach(c=>{ if(!CATEGORIES.includes(c)) CATEGORIES.push(c); });
+  }
+  if(doc.storeProfile){ STORE_PROFILE = Object.assign({}, DEFAULT_STORE_PROFILE, doc.storeProfile); saveLocalOnly(LS.storeProfile, STORE_PROFILE); applyStoreProfile(); }
+  if(doc.palette && THEME_PALETTES[doc.palette]){ applyPalette(doc.palette); saveLocalOnly(LS.palette, doc.palette); }
+  if(doc.siteImages){
+    Object.keys(doc.siteImages.hero || {}).forEach(i=>{ HERO_SLIDES[i] = doc.siteImages.hero[i]; });
+    Object.keys(doc.siteImages.category || {}).forEach(c=>{ CATEGORY_PHOTOS[c] = doc.siteImages.category[c]; });
+    heroSlideImg.src = HERO_SLIDES[heroSlideIdx];
+    renderCatShowcase();
+    saveLocalOnly(LS.siteImages, doc.siteImages);
+  }
+  if(doc.brands){ BRANDS = doc.brands; saveLocalOnly(LS.brands, BRANDS); renderBrands(); }
+  if(doc.heroContent && Object.keys(doc.heroContent).length){ HERO_CONTENT = Object.assign({}, DEFAULT_HERO_CONTENT, doc.heroContent); saveLocalOnly(LS.heroContent, HERO_CONTENT); applyHeroContent(); }
+  if(doc.storeHours && Object.keys(doc.storeHours).length){ STORE_HOURS = Object.assign({}, DEFAULT_STORE_HOURS, doc.storeHours); saveLocalOnly(LS.storeHours, STORE_HOURS); applyStoreHours(); }
+  if(doc.faqs && Array.isArray(doc.faqs) && doc.faqs.length){ FAQS = doc.faqs; renderFAQList(); }
+}
+
+(async function loadSharedStoreData(){
+  if(firestoreDb){
+    try {
+      const snap = await firestoreDb.collection(FIRESTORE_DOC_PATH[0]).doc(FIRESTORE_DOC_PATH[1]).get();
+      if(snap.exists){
+        const doc = snap.data();
+        applyFirestoreAdminFields(doc);
+        rebuildProductsFromStorage();
+        renderChips(); renderProductGrid(); renderBestSellers(); renderNewArrivals(); renderCompareBar();
+        const heroCountEl2 = document.getElementById('heroProductCount');
+        if(heroCountEl2) heroCountEl2.textContent = PRODUCTS.filter(hasImage).length + '+';
+        const openMatch = /^#product-(\d+)$/.exec(location.hash);
+        if(openMatch && productModalScrim.classList.contains('open')){
+          openProductModal(Number(openMatch[1]));
+        }
+        console.log('Applied shared store data from Firebase (live, shared by all visitors)');
+        return; // Firestore succeeded — no need to also fetch the static JSON.
+      }
+    } catch(err){
+      console.log('Firestore read failed (using JSON file / embedded data instead):', err.message);
+    }
+  }
+  /* Fallback: the static JSON file. Requires the page to be served over HTTP (a real
+     web host) — fetch() of a local file is blocked by browsers when opened via file://.
+     If this also fails, the site keeps using the data already embedded above. */
+  try {
+    const res = await fetch('kaka-shoe-plaza-data.json');
+    if(!res.ok) throw new Error('HTTP '+res.status);
+    const data = await res.json();
+    applyFetchedStoreData(data, 'kaka-shoe-plaza-data.json');
+  } catch(err){
+    console.log('kaka-shoe-plaza-data.json not used (using embedded data instead):', err.message);
+  }
+})();
 
 /* deep-link: open a product directly if the page was loaded with #product-ID */
 (function checkDeepLink(){
